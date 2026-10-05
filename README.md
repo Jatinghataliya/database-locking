@@ -88,14 +88,14 @@ sequenceDiagram
     actor T2 as Thread-2
     participant DB as Database
 
-    T1->>DB: SELECT * FROM accounts WHERE id='acc-1'  (version=0)
-    T2->>DB: SELECT * FROM accounts WHERE id='acc-1'  (version=0)
+    T1->>DB: SELECT balance WHERE id=acc-1 (version=0)
+    T2->>DB: SELECT balance WHERE id=acc-1 (version=0)
     T1->>T1: Modify balance in memory
     T2->>T2: Modify balance in memory
-    T1->>DB: UPDATE ... WHERE id='acc-1' AND version=0  (OK, version -> 1)
-    T2->>DB: UPDATE ... WHERE id='acc-1' AND version=0  (CONFLICT - version is now 1)
+    T1->>DB: UPDATE WHERE id=acc-1 AND version=0 - OK, version bumped to 1
+    T2->>DB: UPDATE WHERE id=acc-1 AND version=0 - CONFLICT, version is now 1
     T2->>T2: Retry with fresh read (version=1)
-    T2->>DB: UPDATE ... WHERE id='acc-1' AND version=1  (OK, version -> 2)
+    T2->>DB: UPDATE WHERE id=acc-1 AND version=1 - OK, version bumped to 2
 ```
 
 **SQL equivalent (JPA `@Version`):**
@@ -126,12 +126,12 @@ sequenceDiagram
     participant DB as Database
 
     T1->>DB: BEGIN
-    T1->>DB: SELECT * FROM accounts WHERE id='acc-1' FOR UPDATE  (row LOCKED)
-    T2->>DB: SELECT * FROM accounts WHERE id='acc-1' FOR UPDATE  (BLOCKED)
-    T1->>DB: UPDATE accounts SET balance=... WHERE id='acc-1'
-    T1->>DB: COMMIT  (row UNLOCKED)
-    T2->>DB: SELECT * ... FOR UPDATE  (now proceeds - sees committed value)
-    T2->>DB: UPDATE ... COMMIT
+    T1->>DB: SELECT FOR UPDATE WHERE id=acc-1 - row LOCKED
+    T2->>DB: SELECT FOR UPDATE WHERE id=acc-1 - BLOCKED
+    T1->>DB: UPDATE accounts SET balance WHERE id=acc-1
+    T1->>DB: COMMIT - row UNLOCKED
+    T2->>DB: SELECT FOR UPDATE - now proceeds, sees committed value
+    T2->>DB: UPDATE then COMMIT
 ```
 
 **SQL equivalent:**
@@ -255,21 +255,21 @@ If both threads lock the lower ID first, circular wait is mathematically impossi
 ```mermaid
 sequenceDiagram
     autonumber
-    actor T1 as Thread-1 (acc-1 -> acc-2)
-    actor T2 as Thread-2 (acc-2 -> acc-1)
+    actor T1 as Thread-1 acc-1 then acc-2
+    actor T2 as Thread-2 acc-2 then acc-1
     participant A as Row acc-1
     participant B as Row acc-2
 
     Note over T1,T2: Both use global order: acc-1 before acc-2
     T1->>A: Lock acc-1 (acquired)
-    T2->>A: Lock acc-1... WAIT (T1 holds it)
-    T1->>B: Lock acc-2 (acquired, T2 not competing yet)
+    T2->>A: Lock acc-1 - WAIT, T1 holds it
+    T1->>B: Lock acc-2 (acquired)
     T1->>B: Release acc-2
-    T1->>A: Release acc-1  (COMMIT)
+    T1->>A: Release acc-1 - COMMIT
     T2->>A: Lock acc-1 (now acquired)
     T2->>B: Lock acc-2 (acquired)
     T2->>B: Release acc-2
-    T2->>A: Release acc-1  (COMMIT)
+    T2->>A: Release acc-1 - COMMIT
 ```
 
 ### Prevention Strategy B: Timeout
@@ -379,13 +379,13 @@ TX-2 reads data written but not yet committed by TX-1. If TX-1 rolls back, TX-2 
 sequenceDiagram
     autonumber
     actor T1 as TX-1
-    actor T2 as TX-2 (READ UNCOMMITTED)
+    actor T2 as TX-2 READ UNCOMMITTED
     participant DB as Database
 
-    T1->>DB: UPDATE balance = 0  (NOT committed)
-    T2->>DB: SELECT balance  -> 0  (DIRTY READ)
+    T1->>DB: UPDATE balance = 0 (NOT committed)
+    T2->>DB: SELECT balance - sees 0 (DIRTY READ)
     T1->>DB: ROLLBACK
-    Note over DB: balance is still 1000 - TX2 acted on ghost data
+    Note over DB: balance is still 1000, TX2 acted on ghost data
 ```
 
 - **Java Source:** [`DirtyReadDemo.java`](src/main/java/com/example/locking/isolation/DirtyReadDemo.java)
@@ -400,13 +400,13 @@ TX-1 reads the same row twice. Between reads, TX-2 updates and commits the row. 
 ```mermaid
 sequenceDiagram
     autonumber
-    actor T1 as TX-1 (READ COMMITTED)
+    actor T1 as TX-1 READ COMMITTED
     actor T2 as TX-2
     participant DB as Database
 
-    T1->>DB: SELECT balance  -> 1000 (first read)
-    T2->>DB: UPDATE balance = 0; COMMIT
-    T1->>DB: SELECT balance  -> 0 (NON-REPEATABLE - different value!)
+    T1->>DB: SELECT balance - returns 1000 (first read)
+    T2->>DB: UPDATE balance = 0 then COMMIT
+    T1->>DB: SELECT balance - returns 0 (NON-REPEATABLE, different value!)
 ```
 
 - **Java Source:** [`NonRepeatableReadDemo.java`](src/main/java/com/example/locking/isolation/NonRepeatableReadDemo.java)
@@ -421,13 +421,13 @@ TX-1 runs the same range query twice. Between runs, TX-2 inserts a new row that 
 ```mermaid
 sequenceDiagram
     autonumber
-    actor T1 as TX-1 (REPEATABLE READ)
+    actor T1 as TX-1 REPEATABLE READ
     actor T2 as TX-2
     participant DB as Database
 
-    T1->>DB: SELECT * WHERE balance > 500  -> 2 rows
-    T2->>DB: INSERT account (balance=750); COMMIT
-    T1->>DB: SELECT * WHERE balance > 500  -> 3 rows (PHANTOM row appeared!)
+    T1->>DB: SELECT WHERE balance greater than 500 - returns 2 rows
+    T2->>DB: INSERT account balance=750 then COMMIT
+    T1->>DB: SELECT WHERE balance greater than 500 - returns 3 rows (PHANTOM!)
 ```
 
 - **Java Source:** [`PhantomReadDemo.java`](src/main/java/com/example/locking/isolation/PhantomReadDemo.java)
@@ -442,15 +442,15 @@ Two transactions read-modify-write the same row. The second write silently overw
 ```mermaid
 sequenceDiagram
     autonumber
-    actor T1 as TX-1 (+200)
-    actor T2 as TX-2 (+500)
+    actor T1 as TX-1 plus 200
+    actor T2 as TX-2 plus 500
     participant DB as Database
 
-    T1->>DB: SELECT balance -> 1000
-    T2->>DB: SELECT balance -> 1000
-    T1->>DB: UPDATE balance = 1200  (1000 + 200)
-    T2->>DB: UPDATE balance = 1500  (1000 + 500, overwrites T1!)
-    Note over DB: Final=1500, Expected=1700. T1's +200 is LOST.
+    T1->>DB: SELECT balance - returns 1000
+    T2->>DB: SELECT balance - returns 1000
+    T1->>DB: UPDATE balance = 1200 (added 200)
+    T2->>DB: UPDATE balance = 1500 (added 500, overwrites T1)
+    Note over DB: Final=1500, Expected=1700. T1 update is LOST.
 ```
 
 - **Java Source:** [`LostUpdateDemo.java`](src/main/java/com/example/locking/isolation/LostUpdateDemo.java)
