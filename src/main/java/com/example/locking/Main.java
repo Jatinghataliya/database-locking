@@ -1,7 +1,9 @@
 package com.example.locking;
 
 import com.example.locking.db.InMemoryDatabase;
+import com.example.locking.isolation.*;
 import com.example.locking.locks.*;
+import com.example.locking.propagation.PropagationDemo;
 
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -270,6 +272,66 @@ public class Main {
         ddlLatch.countDown();
         ddlPool.shutdown();
         ddlPool.awaitTermination(10, TimeUnit.SECONDS);
+
+        // ================================================================
+        // 7. ISOLATION LEVELS — ANOMALY DEMOS
+        // ================================================================
+        separator("7. ISOLATION: DIRTY READ");
+        db.reset();
+        DirtyReadDemo dirtyRead = new DirtyReadDemo(db);
+        dirtyRead.demonstrateProblem();
+        dirtyRead.demonstrateFix();
+
+        separator("7b. ISOLATION: NON-REPEATABLE READ");
+        db.reset();
+        NonRepeatableReadDemo nonRepeatable = new NonRepeatableReadDemo(db);
+        nonRepeatable.demonstrateProblem();
+        nonRepeatable.demonstrateFix();
+
+        separator("7c. ISOLATION: PHANTOM READ");
+        db.reset();
+        PhantomReadDemo phantom = new PhantomReadDemo(db);
+        phantom.demonstrateProblem();
+        phantom.demonstrateFix();
+
+        separator("7d. ISOLATION: LOST UPDATE");
+        db.reset();
+        LostUpdateDemo lostUpdate = new LostUpdateDemo(db);
+        lostUpdate.demonstrateProblem();
+        lostUpdate.demonstrateFixPessimistic();
+        lostUpdate.demonstrateFixOptimistic();
+
+        // ================================================================
+        // 8. TRANSACTION PROPAGATION
+        // ================================================================
+        separator("8. PROPAGATION: REQUIRED");
+        db.reset();
+        PropagationDemo propagation = new PropagationDemo(db);
+        propagation.demoRequired();
+
+        separator("8b. PROPAGATION: REQUIRES_NEW");
+        db.reset();
+        propagation.demoRequiresNew();
+
+        separator("8c. PROPAGATION: NESTED");
+        db.reset();
+        propagation.demoNested();
+
+        separator("8d. PROPAGATION: MANDATORY");
+        db.reset();
+        propagation.demoMandatory();
+
+        separator("8e. PROPAGATION: SUPPORTS");
+        db.reset();
+        propagation.demoSupports();
+
+        separator("8f. PROPAGATION: NOT_SUPPORTED");
+        db.reset();
+        propagation.demoNotSupported();
+
+        separator("8g. PROPAGATION: NEVER");
+        db.reset();
+        propagation.demoNever();
 
         separator("ALL DEMOS COMPLETE");
     }

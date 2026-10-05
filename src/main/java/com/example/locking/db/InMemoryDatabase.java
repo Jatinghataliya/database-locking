@@ -3,10 +3,13 @@ package com.example.locking.db;
 import com.example.locking.model.Account;
 import com.example.locking.model.Product;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * InMemoryDatabase — simulates a relational database engine.
@@ -15,6 +18,8 @@ import java.util.concurrent.ConcurrentHashMap;
  *   - Storage for Account and Product rows (ConcurrentHashMap = heap table)
  *   - Row-level exclusive locks   (pessimistic locking simulation)
  *   - Table-level exclusive lock  (full table lock simulation)
+ *   - MVCC snapshot reads         (isolation level simulation)
+ *   - Write-ahead uncommitted log (dirty read simulation)
  *   - Configurable simulated DB latency
  *
  * This is NOT a real database. It exists purely to make the locking
@@ -32,6 +37,26 @@ public class InMemoryDatabase {
     // Row-level locks — maps rowId -> ownerThreadName
     // -------------------------------------------------------------------------
     private final Map<String, String> rowLocks = new ConcurrentHashMap<>();
+
+    // -------------------------------------------------------------------------
+    // MVCC: global transaction timestamp counter
+    // -------------------------------------------------------------------------
+    private final AtomicLong txClock = new AtomicLong(0);
+
+    /**
+     * A committed version entry: the account value + the commit timestamp.
+     * Real MVCC engines (PostgreSQL, InnoDB) store this in the undo log / version chain.
+     */
+    public record AccountVersion(Account account, long commitTs) {}
+
+    /** Version chain per account: all committed versions, oldest first. */
+    private final Map<String, List<AccountVersion>> versionChain = new ConcurrentHashMap<>();
+
+    /**
+     * Uncommitted (dirty) writes: written by a TX but not yet committed.
+     * Used by DirtyReadDemo to let READ_UNCOMMITTED transactions see them.
+     */
+    private final Map<String, Account> uncommittedWrites = new ConcurrentHashMap<>();
 
     // -------------------------------------------------------------------------
     // Table-level lock flag
@@ -207,8 +232,155 @@ public class InMemoryDatabase {
         accounts.clear();
         products.clear();
         rowLocks.clear();
+        versionChain.clear();
+        uncommittedWrites.clear();
         tableLocked    = false;
         tableLockOwner = null;
         seed();
+        // Seed initial version chain snapshots
+        accounts.forEach((id, acc) ->
+            versionChain.computeIfAbsent(id, k -> new ArrayList<>())
+                        .add(new AccountVersion(acc.copy(), 0)));
+    }
+
+    // -------------------------------------------------------------------------
+    // MVCC — Transaction timestamps
+    // -------------------------------------------------------------------------
+
+    /** Begin a new transaction: returns a start timestamp (snapshot point). */
+    public long beginTx() {
+        long ts = txClock.incrementAndGet();
+        System.out.printf("[MVCC] TX started with snapshot timestamp=%d (thread='%s')%n",
+                ts, Thread.currentThread().getName());
+        return ts;
+    }
+
+    // -------------------------------------------------------------------------
+    // MVCC — Snapshot read (REPEATABLE READ / SERIALIZABLE)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Returns the latest committed version of the account that was committed
+     * AT OR BEFORE the given snapshot timestamp.
+     *
+     * This is exactly how PostgreSQL MVCC works:
+     *   - Each TX gets a snapshot at BEGIN time.
+     *   - Reads see only versions committed before the snapshot.
+     *   - Versions committed AFTER the snapshot are invisible — they don't exist yet
+     *     from the perspective of this transaction.
+     */
+    public Optional<Account> snapshotRead(String id, long snapshotTs) {
+        simulateLatency();
+        List<AccountVersion> chain = versionChain.get(id);
+        if (chain == null) return Optional.empty();
+
+        // Walk the version chain newest-first; return the latest visible version
+        AccountVersion visible = null;
+        for (AccountVersion v : chain) {
+            if (v.commitTs() <= snapshotTs) {
+                visible = v;
+            }
+        }
+        if (visible != null) {
+            System.out.printf("[MVCC] Snapshot read id='%s' at snapshotTs=%d -> version committed at ts=%d: %s%n",
+                    id, snapshotTs, visible.commitTs(), visible.account());
+            return Optional.of(visible.account().copy());
+        }
+        return Optional.empty();
+    }
+
+    // -------------------------------------------------------------------------
+    // MVCC — Committed write (publishes a new version to the chain)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Commits a new version of the account to the version chain.
+     * The commit timestamp becomes visible to all future snapshot reads
+     * whose snapshotTs >= commitTs.
+     */
+    public long commitVersion(Account account) {
+        long commitTs = txClock.incrementAndGet();
+        versionChain.computeIfAbsent(account.getId(), k -> new ArrayList<>())
+                    .add(new AccountVersion(account.copy(), commitTs));
+        accounts.put(account.getId(), account); // also update current row
+        System.out.printf("[MVCC] Version committed: id='%s' commitTs=%d -> %s%n",
+                account.getId(), commitTs, account);
+        return commitTs;
+    }
+
+    // -------------------------------------------------------------------------
+    // Dirty read support — uncommitted write log
+    // -------------------------------------------------------------------------
+
+    /**
+     * Writes to the uncommitted buffer WITHOUT publishing to the version chain.
+     * A READ_UNCOMMITTED reader can see this; a READ_COMMITTED reader cannot.
+     */
+    public void writeUncommitted(Account account) {
+        uncommittedWrites.put(account.getId(), account.copy());
+        System.out.printf("[DIRTY] Uncommitted write: id='%s' -> %s (NOT yet committed)%n",
+                account.getId(), account);
+    }
+
+    /**
+     * Simulates ROLLBACK — discards the uncommitted write so dirty readers
+     * that acted on it were working with data that "never existed".
+     */
+    public void rollbackUncommitted(String id) {
+        Account discarded = uncommittedWrites.remove(id);
+        System.out.printf("[DIRTY] ROLLBACK: uncommitted write for id='%s' discarded (%s)%n",
+                id, discarded);
+    }
+
+    /**
+     * READ_UNCOMMITTED: returns the dirty (uncommitted) value if present,
+     * otherwise falls back to the last committed value.
+     */
+    public Optional<Account> readUncommitted(String id) {
+        simulateLatency();
+        Account dirty = uncommittedWrites.get(id);
+        if (dirty != null) {
+            System.out.printf("[DIRTY READ] id='%s' -> reading UNCOMMITTED value: %s%n", id, dirty);
+            return Optional.of(dirty.copy());
+        }
+        return Optional.ofNullable(accounts.get(id)).map(Account::copy);
+    }
+
+    // -------------------------------------------------------------------------
+    // Range query support (phantom read demo)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Returns all accounts whose balance is within [minBalance, maxBalance].
+     * Used by PhantomReadDemo: the result set can change between two calls
+     * if another TX inserts/deletes accounts in that range.
+     */
+    public List<Account> rangeQuery(double minBalance, double maxBalance) {
+        simulateLatency();
+        List<Account> result = new ArrayList<>();
+        for (Account acc : accounts.values()) {
+            if (acc.getBalance() >= minBalance && acc.getBalance() <= maxBalance) {
+                result.add(acc.copy());
+            }
+        }
+        System.out.printf("[DB] Range query [%.0f - %.0f] -> %d rows%n",
+                minBalance, maxBalance, result.size());
+        return result;
+    }
+
+    /** Insert a brand-new account (used by phantom read demo). */
+    public void insertAccount(Account account) {
+        simulateLatency();
+        accounts.put(account.getId(), account);
+        versionChain.computeIfAbsent(account.getId(), k -> new ArrayList<>())
+                    .add(new AccountVersion(account.copy(), txClock.incrementAndGet()));
+        System.out.printf("[DB] INSERT account: %s%n", account);
+    }
+
+    /** Delete an account (used by phantom read demo). */
+    public void deleteAccount(String id) {
+        simulateLatency();
+        accounts.remove(id);
+        System.out.printf("[DB] DELETE account id='%s'%n", id);
     }
 }

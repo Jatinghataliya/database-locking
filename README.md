@@ -2,7 +2,7 @@
 
 A complete, runnable reference covering every major database locking mechanism —
 from Optimistic and Pessimistic locking through Read/Write locks, Two-Phase Locking,
-Deadlock scenarios, and the Intent Lock hierarchy used inside real engines like InnoDB.
+Deadlock scenarios, Intent Lock hierarchy, Isolation Level anomalies, and Transaction Propagation.
 
 ---
 
@@ -16,7 +16,13 @@ Deadlock scenarios, and the Intent Lock hierarchy used inside real engines like 
 7. [Deadlock — Simulation and Prevention](#7-deadlock--simulation-and-prevention)
 8. [Intent Locks (IS / IX / S / X)](#8-intent-locks-is--ix--s--x)
 9. [Lock Comparison Matrix](#9-lock-comparison-matrix)
-10. [Running the Project](#10-running-the-project)
+10. [Isolation Levels and Anomalies](#10-isolation-levels-and-anomalies)
+    - [Dirty Read](#dirty-read)
+    - [Non-Repeatable Read](#non-repeatable-read)
+    - [Phantom Read](#phantom-read)
+    - [Lost Update](#lost-update)
+11. [Transaction Propagation](#11-transaction-propagation)
+12. [Running the Project](#12-running-the-project)
 
 ---
 
@@ -49,14 +55,21 @@ Database-Locking/
     │   ├── Account.java                   Bank account row (id, owner, balance, version)
     │   └── Product.java                   Product inventory row (id, name, stock, version)
     ├── db/
-    │   └── InMemoryDatabase.java          Simulated DB engine with row and table locks
-    └── locks/
-        ├── OptimisticLock.java            Version-based conflict detection
-        ├── PessimisticLock.java           SELECT FOR UPDATE row locking
-        ├── ReadWriteLockDemo.java         Shared reads / exclusive writes
-        ├── TwoPhaseLock.java              Growing + shrinking phase (Strict 2PL)
-        ├── DeadlockDemo.java              Deadlock simulation + prevention
-        └── IntentLockDemo.java            IS / IX / S / X InnoDB-style hierarchy
+    │   └── InMemoryDatabase.java          Simulated DB with row/table locks + MVCC version chain
+    ├── locks/
+    │   ├── OptimisticLock.java            Version-based conflict detection
+    │   ├── PessimisticLock.java           SELECT FOR UPDATE row locking
+    │   ├── ReadWriteLockDemo.java         Shared reads / exclusive writes
+    │   ├── TwoPhaseLock.java              Growing + shrinking phase (Strict 2PL)
+    │   ├── DeadlockDemo.java              Deadlock simulation + prevention
+    │   └── IntentLockDemo.java            IS / IX / S / X InnoDB-style hierarchy
+    ├── isolation/
+    │   ├── DirtyReadDemo.java             READ_UNCOMMITTED anomaly + READ_COMMITTED fix
+    │   ├── NonRepeatableReadDemo.java     READ_COMMITTED anomaly + REPEATABLE_READ fix (MVCC)
+    │   ├── PhantomReadDemo.java           REPEATABLE_READ anomaly + SERIALIZABLE fix
+    │   └── LostUpdateDemo.java            Lost update + pessimistic/optimistic fixes
+    └── propagation/
+        └── PropagationDemo.java           All 7 Spring propagation types simulated
 ```
 
 ---
@@ -343,7 +356,152 @@ sequenceDiagram
 
 ---
 
-## 10. Running the Project
+## 10. Isolation Levels and Anomalies
+
+Isolation defines how much a transaction can see of other concurrent transactions' changes.
+
+| Isolation Level | Dirty Read | Non-repeatable Read | Phantom Read | Default in |
+| :--- | :---: | :---: | :---: | :--- |
+| **READ UNCOMMITTED** | Possible | Possible | Possible | (rarely used) |
+| **READ COMMITTED** | Prevented | Possible | Possible | PostgreSQL, Oracle |
+| **REPEATABLE READ** | Prevented | Prevented | Possible* | MySQL InnoDB |
+| **SERIALIZABLE** | Prevented | Prevented | Prevented | All (optional) |
+
+*InnoDB uses gap locks to also prevent phantoms at REPEATABLE READ.
+
+---
+
+### Dirty Read
+
+TX-2 reads data written but not yet committed by TX-1. If TX-1 rolls back, TX-2 acted on data that never existed.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor T1 as TX-1
+    actor T2 as TX-2 (READ UNCOMMITTED)
+    participant DB as Database
+
+    T1->>DB: UPDATE balance = 0  (NOT committed)
+    T2->>DB: SELECT balance  -> 0  (DIRTY READ)
+    T1->>DB: ROLLBACK
+    Note over DB: balance is still 1000 - TX2 acted on ghost data
+```
+
+- **Java Source:** [`DirtyReadDemo.java`](src/main/java/com/example/locking/isolation/DirtyReadDemo.java)
+- **Fix:** READ COMMITTED + MVCC snapshot reads — only committed versions are visible.
+
+---
+
+### Non-Repeatable Read
+
+TX-1 reads the same row twice. Between reads, TX-2 updates and commits the row. TX-1 sees different values.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor T1 as TX-1 (READ COMMITTED)
+    actor T2 as TX-2
+    participant DB as Database
+
+    T1->>DB: SELECT balance  -> 1000 (first read)
+    T2->>DB: UPDATE balance = 0; COMMIT
+    T1->>DB: SELECT balance  -> 0 (NON-REPEATABLE - different value!)
+```
+
+- **Java Source:** [`NonRepeatableReadDemo.java`](src/main/java/com/example/locking/isolation/NonRepeatableReadDemo.java)
+- **Fix:** REPEATABLE READ — MVCC snapshot taken at BEGIN; all reads use same snapshot timestamp.
+
+---
+
+### Phantom Read
+
+TX-1 runs the same range query twice. Between runs, TX-2 inserts a new row that falls in the range.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor T1 as TX-1 (REPEATABLE READ)
+    actor T2 as TX-2
+    participant DB as Database
+
+    T1->>DB: SELECT * WHERE balance > 500  -> 2 rows
+    T2->>DB: INSERT account (balance=750); COMMIT
+    T1->>DB: SELECT * WHERE balance > 500  -> 3 rows (PHANTOM row appeared!)
+```
+
+- **Java Source:** [`PhantomReadDemo.java`](src/main/java/com/example/locking/isolation/PhantomReadDemo.java)
+- **Fix:** SERIALIZABLE — predicate/range locks or MVCC snapshot prevents new rows from appearing.
+
+---
+
+### Lost Update
+
+Two transactions read-modify-write the same row. The second write silently overwrites the first.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor T1 as TX-1 (+200)
+    actor T2 as TX-2 (+500)
+    participant DB as Database
+
+    T1->>DB: SELECT balance -> 1000
+    T2->>DB: SELECT balance -> 1000
+    T1->>DB: UPDATE balance = 1200  (1000 + 200)
+    T2->>DB: UPDATE balance = 1500  (1000 + 500, overwrites T1!)
+    Note over DB: Final=1500, Expected=1700. T1's +200 is LOST.
+```
+
+- **Java Source:** [`LostUpdateDemo.java`](src/main/java/com/example/locking/isolation/LostUpdateDemo.java)
+- **Fix A:** Pessimistic — `SELECT FOR UPDATE` serialises both writes.
+- **Fix B:** Optimistic — version check rejects the stale writer; retry with fresh read.
+
+---
+
+## 11. Transaction Propagation
+
+Propagation controls what happens when one transactional method calls another.
+
+| Type | Behaviour | Use case |
+| :--- | :--- | :--- |
+| **REQUIRED** | Join existing TX; create new if none | Default - most service calls |
+| **REQUIRES_NEW** | Suspend outer TX; start independent TX | Audit logs, notifications |
+| **NESTED** | Savepoint within outer TX; inner can rollback independently | Optional sub-tasks |
+| **MANDATORY** | Must have active TX or throw | Internal DAO methods |
+| **SUPPORTS** | Join if TX exists; run without if not | Optional transactional reads |
+| **NOT_SUPPORTED** | Suspend TX; run non-transactionally | Bulk non-critical operations |
+| **NEVER** | Throw if TX exists | Non-transactional utilities |
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor S as Service A (outer TX)
+    actor B as Service B (inner)
+    participant DB as Database
+
+    Note over S: REQUIRED - B joins outer TX
+    S->>B: call (REQUIRED)
+    B-->>S: joined TX-1 - commits together
+
+    Note over S: REQUIRES_NEW - B gets own TX
+    S->>B: call (REQUIRES_NEW)
+    Note over B: TX-1 suspended, TX-2 starts
+    B-->>S: TX-2 committed independently
+    Note over S: TX-1 resumes
+
+    Note over S: NESTED - B runs in savepoint
+    S->>B: call (NESTED)
+    Note over B: savepoint created
+    B-->>S: inner rollback only to savepoint
+    Note over S: outer TX continues
+```
+
+- **Java Source:** [`PropagationDemo.java`](src/main/java/com/example/locking/propagation/PropagationDemo.java)
+
+---
+
+## 12. Running the Project
 
 ### Requirements
 - Java 17+
@@ -360,12 +518,22 @@ mvn compile exec:java -Dexec.mainClass="com.example.locking.Main"
 ```
 ============================================================
   1. OPTIMISTIC LOCKING
-============================================================
   2. PESSIMISTIC LOCKING
   3. READ / WRITE LOCK (Shared vs Exclusive)
   4. TWO-PHASE LOCKING (2PL - Strict)
   5. DEADLOCK - Simulation and Prevention
   6. INTENT LOCKS (IS / IX / S / X)
+  7. ISOLATION: DIRTY READ
+  7b. ISOLATION: NON-REPEATABLE READ
+  7c. ISOLATION: PHANTOM READ
+  7d. ISOLATION: LOST UPDATE
+  8. PROPAGATION: REQUIRED
+  8b. PROPAGATION: REQUIRES_NEW
+  8c. PROPAGATION: NESTED
+  8d. PROPAGATION: MANDATORY
+  8e. PROPAGATION: SUPPORTS
+  8f. PROPAGATION: NOT_SUPPORTED
+  8g. PROPAGATION: NEVER
 ============================================================
   ALL DEMOS COMPLETE
 ============================================================
